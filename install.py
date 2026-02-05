@@ -29,6 +29,7 @@ import os
 import getpass
 import shutil
 import tempfile
+import time
 import urllib.request
 import tarfile
 from pathlib import Path
@@ -471,6 +472,77 @@ def check_requirements():
     print("All requirements met.")
 
 
+def reload_partition_table(disk: str):
+    """Reload the partition table using multiple methods with fallbacks.
+
+    partprobe can fail with 'Device or resource busy' if the kernel still
+    has references to old partitions. This is common when running from a
+    live environment. We try multiple methods and ultimately verify that
+    the partition devices actually exist.
+    """
+    print("\n--- Reloading Partition Table ---")
+
+    # Method 1: partprobe on specific disk
+    result = run(f"partprobe {disk}", check=False)
+    if result.returncode == 0:
+        print("partprobe succeeded")
+        time.sleep(2)
+        return
+
+    print("partprobe returned non-zero, trying alternative methods...")
+
+    # Method 2: blockdev --rereadpt
+    result = run(f"blockdev --rereadpt {disk}", check=False)
+    if result.returncode == 0:
+        print("blockdev --rereadpt succeeded")
+        time.sleep(2)
+        # Still verify partitions exist below
+
+    # Method 3: partx -u (update partition table)
+    result = run(f"partx -u {disk}", check=False)
+    if result.returncode == 0:
+        print("partx -u succeeded")
+        time.sleep(2)
+
+    # Give the kernel time to process
+    time.sleep(2)
+
+    # Verify partition devices actually exist - this is the real test
+    # Even if partprobe fails, the partitions may have been created
+    partitions_exist = True
+    for part in [f"{disk}p1", f"{disk}p2", f"{disk}p3"]:
+        if not Path(part).exists():
+            partitions_exist = False
+            print(f"Warning: {part} does not exist yet")
+
+    if partitions_exist:
+        print("All partition devices exist - continuing installation")
+        return
+
+    # Final fallback: trigger udev and wait
+    print("Partitions not yet visible, triggering udev...")
+    run("udevadm settle --timeout=10", check=False)
+    time.sleep(2)
+
+    # Final verification
+    missing = []
+    for part in [f"{disk}p1", f"{disk}p2", f"{disk}p3"]:
+        if not Path(part).exists():
+            missing.append(part)
+
+    if missing:
+        print(f"\nERROR: Partition devices not found: {', '.join(missing)}")
+        print("\nThis can happen when running from a live environment that")
+        print("has mounted or used the target disk previously.")
+        print("\nPossible solutions:")
+        print("  1. Reboot into the live environment and try again")
+        print("  2. Ensure no partitions from this disk are mounted")
+        print("  3. Check 'lsblk' to see current disk state")
+        sys.exit(1)
+
+    print("All partition devices exist - continuing installation")
+
+
 def partition_disk():
     """Create GPT partitions on the disk."""
     print("\n=== Partitioning Disk ===")
@@ -490,9 +562,9 @@ def partition_disk():
     # Root partition (remaining space)
     run(f"sgdisk -n 3:0:0 -t 3:8309 -c 3:'Linux LUKS' {DISK}")
 
-    # Reload partition table
-    run("partprobe")
-    run("sleep 2")
+    # Reload partition table - try multiple methods as partprobe can fail
+    # when the kernel has stale references to old partitions
+    reload_partition_table(DISK)
 
     # Verify partitions were created correctly
     verify_partitions()
