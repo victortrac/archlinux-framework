@@ -149,8 +149,8 @@ def setup_arch_tools_on_ubuntu():
     print("Installing required packages on Ubuntu...")
     subprocess.run("apt-get update", shell=True, check=True)
     subprocess.run(
-        "apt-get install -y wget tar zstd arch-install-scripts 2>/dev/null || "
-        "apt-get install -y wget tar zstd",
+        "apt-get install -y wget tar zstd parted kpartx arch-install-scripts 2>/dev/null || "
+        "apt-get install -y wget tar zstd parted kpartx",
         shell=True,
         check=True
     )
@@ -482,70 +482,169 @@ def reload_partition_table(disk: str):
     """
     print("\n--- Reloading Partition Table ---")
 
+    def partitions_exist():
+        """Check if all partition devices exist."""
+        for part in [f"{disk}p1", f"{disk}p2", f"{disk}p3"]:
+            if not Path(part).exists():
+                return False
+        return True
+
     # Method 1: partprobe on specific disk
     result = run(f"partprobe {disk}", check=False)
     if result.returncode == 0:
         print("partprobe succeeded")
         time.sleep(2)
-        return
+        if partitions_exist():
+            return
 
-    print("partprobe returned non-zero, trying alternative methods...")
+    print("partprobe returned non-zero or partitions not visible, trying alternatives...")
 
     # Method 2: blockdev --rereadpt
     result = run(f"blockdev --rereadpt {disk}", check=False)
     if result.returncode == 0:
         print("blockdev --rereadpt succeeded")
         time.sleep(2)
-        # Still verify partitions exist below
+        if partitions_exist():
+            print("All partition devices exist - continuing installation")
+            return
 
-    # Method 3: partx -u (update partition table)
-    result = run(f"partx -u {disk}", check=False)
+    # Method 3: partx -a (add all partitions)
+    print("Trying partx to add partitions...")
+    run(f"partx -d {disk} 2>/dev/null || true", check=False)  # Remove first
+    result = run(f"partx -a {disk}", check=False)
     if result.returncode == 0:
-        print("partx -u succeeded")
+        print("partx -a succeeded")
         time.sleep(2)
+        if partitions_exist():
+            print("All partition devices exist - continuing installation")
+            return
+
+    # Method 4: kpartx - forcefully create device mappings
+    print("Trying kpartx to create partition mappings...")
+    run(f"kpartx -d {disk} 2>/dev/null || true", check=False)  # Remove old mappings
+    result = run(f"kpartx -av {disk}", check=False)
+    if result.returncode == 0:
+        print("kpartx succeeded")
+        time.sleep(2)
+        # kpartx creates /dev/mapper/diskpN devices, check for those too
+        disk_name = Path(disk).name
+        kpartx_devs_exist = all(
+            Path(f"/dev/mapper/{disk_name}p{i}").exists() for i in range(1, 4)
+        )
+        if partitions_exist() or kpartx_devs_exist:
+            # If kpartx created mapper devices, create symlinks to expected paths
+            if kpartx_devs_exist and not partitions_exist():
+                print("Creating symlinks from kpartx devices...")
+                for i in range(1, 4):
+                    src = f"/dev/mapper/{disk_name}p{i}"
+                    dst = f"{disk}p{i}"
+                    if Path(src).exists() and not Path(dst).exists():
+                        run(f"ln -sf {src} {dst}", check=False)
+            print("Partition devices available - continuing installation")
+            return
 
     # Give the kernel time to process
     time.sleep(2)
 
-    # Verify partition devices actually exist - this is the real test
-    # Even if partprobe fails, the partitions may have been created
-    partitions_exist = True
-    for part in [f"{disk}p1", f"{disk}p2", f"{disk}p3"]:
-        if not Path(part).exists():
-            partitions_exist = False
-            print(f"Warning: {part} does not exist yet")
-
-    if partitions_exist:
-        print("All partition devices exist - continuing installation")
-        return
-
-    # Final fallback: trigger udev and wait
-    print("Partitions not yet visible, triggering udev...")
+    # Trigger udev and wait
+    print("Triggering udev...")
+    run("udevadm trigger", check=False)
     run("udevadm settle --timeout=10", check=False)
     time.sleep(2)
 
     # Final verification
-    missing = []
-    for part in [f"{disk}p1", f"{disk}p2", f"{disk}p3"]:
-        if not Path(part).exists():
-            missing.append(part)
+    if partitions_exist():
+        print("All partition devices exist - continuing installation")
+        return
 
-    if missing:
-        print(f"\nERROR: Partition devices not found: {', '.join(missing)}")
-        print("\nThis can happen when running from a live environment that")
-        print("has mounted or used the target disk previously.")
-        print("\nPossible solutions:")
-        print("  1. Reboot into the live environment and try again")
-        print("  2. Ensure no partitions from this disk are mounted")
-        print("  3. Check 'lsblk' to see current disk state")
-        sys.exit(1)
+    # Check for kpartx devices one more time
+    disk_name = Path(disk).name
+    kpartx_devs = [f"/dev/mapper/{disk_name}p{i}" for i in range(1, 4)]
+    if all(Path(dev).exists() for dev in kpartx_devs):
+        print("Using kpartx device mappings...")
+        for i in range(1, 4):
+            src = f"/dev/mapper/{disk_name}p{i}"
+            dst = f"{disk}p{i}"
+            if not Path(dst).exists():
+                run(f"ln -sf {src} {dst}", check=False)
+        if partitions_exist():
+            print("Partition devices available via symlinks - continuing installation")
+            return
 
-    print("All partition devices exist - continuing installation")
+    # Give up with helpful error
+    missing = [f"{disk}p{i}" for i in range(1, 4) if not Path(f"{disk}p{i}").exists()]
+    print(f"\nERROR: Partition devices not found: {', '.join(missing)}")
+    print("\nThe kernel is unable to recognize the new partition table.")
+    print("This is a known issue when running from a live environment")
+    print("that has previously accessed the target disk.")
+    print("\nRECOMMENDED: Reboot the live environment and run the installer again.")
+    print("\nAlternative solutions:")
+    print("  1. Run: kpartx -av " + disk)
+    print("  2. Check 'lsblk' and 'dmsetup ls' for conflicting mappings")
+    print("  3. Ensure no processes are using the disk (lsof " + disk + ")")
+    sys.exit(1)
+
+
+def cleanup_disk_references(disk: str):
+    """Aggressively clean up any kernel references to the disk before partitioning.
+
+    This is necessary when running from a live environment that may have
+    previously accessed the disk, leaving stale partition mappings.
+    """
+    print("\n--- Cleaning Up Disk References ---")
+
+    # Get the disk basename (e.g., "nvme0n1" from "/dev/nvme0n1")
+    disk_name = Path(disk).name
+
+    # 1. Unmount any mounted partitions from this disk
+    print("Unmounting any mounted partitions...")
+    result = run("mount", capture=True, check=False)
+    for line in result.stdout.splitlines():
+        if disk in line:
+            mount_point = line.split()[2] if len(line.split()) > 2 else None
+            if mount_point:
+                run(f"umount -l {mount_point}", check=False)
+
+    # 2. Deactivate any swap on this disk
+    print("Deactivating swap...")
+    run(f"swapoff {disk}p2 2>/dev/null || true", check=False)
+    run(f"swapoff {disk}* 2>/dev/null || true", check=False)
+
+    # 3. Close any LUKS mappings that might use this disk
+    print("Closing any LUKS mappings...")
+    result = run("dmsetup ls", capture=True, check=False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if "crypt" in line.lower() or "luks" in line.lower():
+                dm_name = line.split()[0]
+                run(f"cryptsetup close {dm_name}", check=False)
+
+    # 4. Remove device-mapper entries for this disk
+    print("Removing device-mapper entries...")
+    for i in range(1, 10):
+        run(f"dmsetup remove {disk_name}p{i} 2>/dev/null || true", check=False)
+        run(f"dmsetup remove {disk}p{i} 2>/dev/null || true", check=False)
+
+    # 5. Remove partition mappings with kpartx
+    print("Removing partition mappings...")
+    run(f"kpartx -d {disk} 2>/dev/null || true", check=False)
+
+    # 6. Force kernel to drop caches related to the disk
+    run("sync", check=False)
+    run("echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true", check=False)
+
+    # 7. Wait a moment for everything to settle
+    time.sleep(1)
+
+    print("Disk cleanup complete.")
 
 
 def partition_disk():
     """Create GPT partitions on the disk."""
     print("\n=== Partitioning Disk ===")
+
+    # Aggressively clean up any existing references to the disk
+    cleanup_disk_references(DISK)
 
     # Wipe existing partitions
     run(f"wipefs -af {DISK}")
