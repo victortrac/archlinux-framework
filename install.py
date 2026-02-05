@@ -1351,14 +1351,16 @@ def configure_system(root_password: str, username: str, user_password: str):
 127.0.1.1   {HOSTNAME}.localdomain {HOSTNAME}
 """)
 
-    # Set root password
-    run(f"echo 'root:{root_password}' | chpasswd", chroot=True,
-        sensitive=True, display_cmd="chpasswd (setting root password)")
+    # Set root password using chpasswd -R to avoid PAM issues in chroot
+    # Using -R applies changes directly to the target root without needing chroot
+    run(f"echo 'root:{root_password}' | chpasswd -R {MOUNT_POINT}", chroot=False,
+        sensitive=True, display_cmd=f"chpasswd -R {MOUNT_POINT} (setting root password)")
 
     # Create user
     run(f"useradd -m -G wheel,video,audio,input -s /bin/bash {username}", chroot=True)
-    run(f"echo '{username}:{user_password}' | chpasswd", chroot=True,
-        sensitive=True, display_cmd=f"chpasswd (setting password for {username})")
+    # Set user password using chpasswd -R to avoid PAM issues in chroot
+    run(f"echo '{username}:{user_password}' | chpasswd -R {MOUNT_POINT}", chroot=False,
+        sensitive=True, display_cmd=f"chpasswd -R {MOUNT_POINT} (setting password for {username})")
 
     # Enable sudo for wheel group
     with open(f"{MOUNT_POINT}/etc/sudoers.d/wheel", "w") as f:
