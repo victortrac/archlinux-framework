@@ -392,6 +392,7 @@ def setup_arch_tools_on_ubuntu():
     if Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacman").exists():
         print("Arch bootstrap already exists, reusing...")
         setup_bootstrap_mounts(ARCH_BOOTSTRAP_DIR)
+        configure_bootstrap_mirrors(ARCH_BOOTSTRAP_DIR)
         return
 
     Path(ARCH_BOOTSTRAP_DIR).mkdir(parents=True, exist_ok=True)
@@ -412,12 +413,8 @@ def setup_arch_tools_on_ubuntu():
     # Set up mounts for the bootstrap environment
     setup_bootstrap_mounts(ARCH_BOOTSTRAP_DIR)
 
-    # Enable a mirror in pacman.conf
-    print("Configuring pacman mirrors...")
-    mirrorlist = f"{ARCH_BOOTSTRAP_DIR}/etc/pacman.d/mirrorlist"
-    with open(mirrorlist, "w") as f:
-        f.write("Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n")
-        f.write("Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\n")
+    # Configure mirrors
+    configure_bootstrap_mirrors(ARCH_BOOTSTRAP_DIR)
 
     # Initialize pacman keyring inside the bootstrap chroot
     print("Initializing pacman keyring (this may take a moment)...")
@@ -425,6 +422,15 @@ def setup_arch_tools_on_ubuntu():
     subprocess.run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacman-key --populate archlinux'", shell=True, check=True)
 
     print("Arch bootstrap tools ready.")
+
+
+def configure_bootstrap_mirrors(bootstrap_dir: str):
+    """Configure pacman mirrors in the bootstrap environment."""
+    print("Configuring pacman mirrors...")
+    mirrorlist = f"{bootstrap_dir}/etc/pacman.d/mirrorlist"
+    with open(mirrorlist, "w") as f:
+        f.write("Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n")
+        f.write("Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\n")
 
 
 def setup_bootstrap_mounts(bootstrap_dir: str):
