@@ -155,13 +155,13 @@ def setup_arch_tools_on_ubuntu():
         check=True
     )
 
-    # Check if arch-install-scripts is available (provides pacstrap, genfstab, arch-chroot)
-    if shutil.which("pacstrap"):
-        print("arch-install-scripts is available from Ubuntu repos")
+    # Check if pacman is available (not just pacstrap - Ubuntu provides pacstrap without pacman)
+    if shutil.which("pacman"):
+        print("pacman is available - can use native arch-install-scripts")
         return
 
-    # If arch-install-scripts not available, download Arch bootstrap
-    print("Downloading Arch Linux bootstrap...")
+    # Need to download Arch bootstrap since pacman is not available
+    print("pacman not found - downloading Arch Linux bootstrap...")
     ARCH_BOOTSTRAP_DIR = "/tmp/arch-bootstrap"
     Path(ARCH_BOOTSTRAP_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -832,13 +832,15 @@ def install_base_system():
         "fprintd",  # Fingerprint reader
     ]
 
-    # Use pacstrap (either native or from bootstrap)
-    if shutil.which("pacstrap"):
-        run(f"pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
-    elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap").exists():
+    # Use pacstrap (prefer bootstrap if available, since Ubuntu's pacstrap lacks pacman)
+    if ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap").exists():
         run(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
+    elif shutil.which("pacstrap") and shutil.which("pacman"):
+        # Only use system pacstrap if pacman is also available
+        run(f"pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
     else:
-        print("Error: pacstrap not found. Cannot install base system.")
+        print("Error: pacstrap/pacman not found. Cannot install base system.")
+        print("On Ubuntu, the Arch bootstrap should have been downloaded.")
         sys.exit(1)
 
     print("Base system installed.")
@@ -848,11 +850,11 @@ def generate_fstab():
     """Generate fstab file."""
     print("\n=== Generating fstab ===")
 
-    # Use genfstab (either native or from bootstrap)
-    if shutil.which("genfstab"):
-        run(f"genfstab -U {MOUNT_POINT} >> {MOUNT_POINT}/etc/fstab")
-    elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/genfstab").exists():
+    # Use genfstab (prefer bootstrap if available)
+    if ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/genfstab").exists():
         run(f"{ARCH_BOOTSTRAP_DIR}/bin/genfstab -U {MOUNT_POINT} >> {MOUNT_POINT}/etc/fstab")
+    elif shutil.which("genfstab"):
+        run(f"genfstab -U {MOUNT_POINT} >> {MOUNT_POINT}/etc/fstab")
     else:
         # Manual fstab generation as fallback
         print("genfstab not found, generating fstab manually...")
