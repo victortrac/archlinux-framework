@@ -473,7 +473,8 @@ def manual_chroot_cleanup(mount_point: str):
 
 
 def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = False,
-        sensitive: bool = False, display_cmd: str = None) -> subprocess.CompletedProcess:
+        sensitive: bool = False, display_cmd: str = None,
+        interactive_errors: bool = True) -> subprocess.CompletedProcess:
     """Execute a shell command.
 
     Args:
@@ -483,6 +484,7 @@ def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = Fals
         chroot: Run command in chroot environment
         sensitive: If True, don't print the actual command (contains secrets)
         display_cmd: Alternative command string to display (use with sensitive=True)
+        interactive_errors: If True and check=True, prompt user on failure with skip/retry/abort options
     """
     if chroot:
         # Prefer arch-chroot if available
@@ -508,7 +510,42 @@ def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = Fals
     else:
         print(f">>> {cmd}")
 
-    return subprocess.run(cmd, shell=True, check=check, capture_output=capture, text=True)
+    while True:
+        result = subprocess.run(cmd, shell=True, check=False, capture_output=capture, text=True)
+
+        if result.returncode == 0:
+            return result
+
+        # Command failed
+        if not check:
+            return result
+
+        # check=True and command failed
+        if not interactive_errors:
+            # Raise exception as before
+            raise subprocess.CalledProcessError(result.returncode, cmd,
+                                                result.stdout if capture else None,
+                                                result.stderr if capture else None)
+
+        # Interactive error handling
+        print(f"\nCommand failed with exit code {result.returncode}")
+        if capture and result.stderr:
+            print(f"Error output: {result.stderr.strip()}")
+
+        while True:
+            response = input("[s]kip this command, [r]etry, or [a]bort? ").strip().lower()
+            if response in ('s', 'skip'):
+                print("Skipping command...")
+                return result  # Return failed result but don't raise
+            elif response in ('r', 'retry'):
+                print("Retrying...")
+                break  # Break inner loop to retry command
+            elif response in ('a', 'abort'):
+                raise subprocess.CalledProcessError(result.returncode, cmd,
+                                                    result.stdout if capture else None,
+                                                    result.stderr if capture else None)
+            else:
+                print("Please enter 's' to skip, 'r' to retry, or 'a' to abort.")
 
 
 def confirm(prompt: str) -> bool:
