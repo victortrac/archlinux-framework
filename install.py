@@ -997,32 +997,51 @@ def setup_encryption(luks_password: str):
     """Set up LUKS encryption on root partition."""
     print("\n=== Setting Up Encryption ===")
 
-    # Clean up any existing LUKS mappings or stale references to the partition
-    print("Cleaning up any existing encryption mappings...")
+    # Get disk basename for device-mapper cleanup
+    disk_name = Path(DISK).name  # e.g., "nvme0n1"
+
+    # Aggressive cleanup of any existing mappings
+    print("Cleaning up any existing mappings...")
+
+    # 1. Close the cryptroot mapping if it exists
     run(f"cryptsetup close {CRYPT_NAME} 2>/dev/null || true", check=False)
 
-    # Close any other LUKS mappings that might be using this partition
-    result = run("dmsetup ls", capture=True, check=False)
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            dm_name = line.split()[0] if line.split() else ""
-            if dm_name:
-                run(f"cryptsetup close {dm_name} 2>/dev/null || true", check=False)
-
-    # Remove any device-mapper entries for the root partition
-    run(f"dmsetup remove {ROOT_PART} 2>/dev/null || true", check=False)
-
-    # Make sure partition is not in use
-    run(f"fuser -k {ROOT_PART} 2>/dev/null || true", check=False)
-
-    # Remove kpartx mappings that might interfere
+    # 2. Remove kpartx mappings FIRST (these create /dev/mapper/nvme0n1pN entries)
     run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
 
-    # Wipe any existing LUKS header or filesystem signatures
-    run(f"wipefs -af {ROOT_PART}", check=False)
+    # 3. Remove ALL device-mapper entries related to this disk
+    result = run("dmsetup ls", capture=True, check=False)
+    if result.returncode == 0 and result.stdout.strip():
+        for line in result.stdout.splitlines():
+            if not line.strip() or "No devices found" in line:
+                continue
+            dm_name = line.split()[0] if line.split() else ""
+            if dm_name and (disk_name in dm_name or "crypt" in dm_name.lower()):
+                print(f"  Removing device-mapper entry: {dm_name}")
+                run(f"dmsetup remove -f {dm_name} 2>/dev/null || true", check=False)
 
-    # Small delay to let kernel release resources
-    time.sleep(1)
+    # 4. Force remove specific partition mapper entries
+    for i in range(1, 10):
+        run(f"dmsetup remove -f {disk_name}p{i} 2>/dev/null || true", check=False)
+        run(f"dmsetup remove -f /dev/mapper/{disk_name}p{i} 2>/dev/null || true", check=False)
+
+    # 5. Kill any processes using the partition
+    run(f"fuser -k {ROOT_PART} 2>/dev/null || true", check=False)
+    run(f"fuser -k /dev/mapper/{disk_name}p3 2>/dev/null || true", check=False)
+
+    # 6. Unmount if somehow mounted
+    run(f"umount -l {ROOT_PART} 2>/dev/null || true", check=False)
+    run(f"umount -l /dev/mapper/{disk_name}p3 2>/dev/null || true", check=False)
+
+    # 7. Run kpartx -d again after removing dm entries
+    run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
+
+    # 8. Wipe any existing LUKS header or filesystem signatures
+    run(f"wipefs -af {ROOT_PART} 2>/dev/null || true", check=False)
+
+    # 9. Sync and let kernel catch up
+    run("sync", check=False)
+    time.sleep(2)
 
     # Format with LUKS2 (using argon2id for better security)
     # Note: Using pbkdf2 for GRUB compatibility if needed later
