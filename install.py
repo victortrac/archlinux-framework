@@ -533,19 +533,34 @@ def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = Fals
             print(f"Error output: {result.stderr.strip()}")
 
         while True:
-            response = input("[s]kip this command, [r]etry, or [a]bort? ").strip().lower()
+            response = input("[s]kip, [r]etry, [e]dit (open shell), or [a]bort? ").strip().lower()
             if response in ('s', 'skip'):
                 print("Skipping command...")
                 return result  # Return failed result but don't raise
             elif response in ('r', 'retry'):
                 print("Retrying...")
                 break  # Break inner loop to retry command
+            elif response in ('e', 'edit'):
+                print("Opening shell for manual intervention...")
+                print("Type 'exit' when done to return to the installer.")
+                if chroot:
+                    # Open shell in chroot environment
+                    if shutil.which("arch-chroot"):
+                        subprocess.run(f"arch-chroot {MOUNT_POINT} /bin/bash", shell=True)
+                    elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot").exists():
+                        subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {MOUNT_POINT} /bin/bash", shell=True)
+                    else:
+                        subprocess.run(f"chroot {MOUNT_POINT} /bin/bash", shell=True)
+                else:
+                    subprocess.run("/bin/bash", shell=True)
+                print("Returned from shell.")
+                # Loop back to ask what to do next
             elif response in ('a', 'abort'):
                 raise subprocess.CalledProcessError(result.returncode, cmd,
                                                     result.stdout if capture else None,
                                                     result.stderr if capture else None)
             else:
-                print("Please enter 's' to skip, 'r' to retry, or 'a' to abort.")
+                print("Please enter 's' to skip, 'r' to retry, 'e' to edit, or 'a' to abort.")
 
 
 def confirm(prompt: str) -> bool:
