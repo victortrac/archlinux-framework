@@ -1003,13 +1003,33 @@ def setup_encryption(luks_password: str):
     # Aggressive cleanup of any existing mappings
     print("Cleaning up any existing mappings...")
 
-    # 1. Close the cryptroot mapping if it exists
-    run(f"cryptsetup close {CRYPT_NAME} 2>/dev/null || true", check=False)
+    # 1. FIRST: Unmount everything from /mnt (cryptroot might be mounted there)
+    print("  Unmounting /mnt...")
+    run("swapoff -a 2>/dev/null || true", check=False)
+    run(f"umount -R {MOUNT_POINT} 2>/dev/null || true", check=False)
+    run(f"umount -l {MOUNT_POINT} 2>/dev/null || true", check=False)
 
-    # 2. Remove kpartx mappings FIRST (these create /dev/mapper/nvme0n1pN entries)
+    # 2. Unmount cryptroot device if mounted anywhere
+    print("  Unmounting cryptroot device...")
+    run(f"umount -l {CRYPT_PATH} 2>/dev/null || true", check=False)
+    run(f"umount -l /dev/mapper/{CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # 3. Kill any processes using cryptroot
+    print("  Killing processes using cryptroot...")
+    run(f"fuser -km {CRYPT_PATH} 2>/dev/null || true", check=False)
+    run(f"fuser -km /dev/mapper/{CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # 4. NOW close the cryptroot LUKS mapping
+    print("  Closing LUKS device...")
+    run(f"cryptsetup close {CRYPT_NAME} 2>/dev/null || true", check=False)
+    # Try with dmsetup as fallback
+    run(f"dmsetup remove -f {CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # 5. Remove kpartx mappings
+    print("  Removing kpartx mappings...")
     run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
 
-    # 3. Remove ALL device-mapper entries related to this disk
+    # 6. Remove ALL device-mapper entries related to this disk
     result = run("dmsetup ls", capture=True, check=False)
     if result.returncode == 0 and result.stdout.strip():
         for line in result.stdout.splitlines():
@@ -1020,31 +1040,33 @@ def setup_encryption(luks_password: str):
                 print(f"  Removing device-mapper entry: {dm_name}")
                 run(f"dmsetup remove -f {dm_name} 2>/dev/null || true", check=False)
 
-    # 4. Force remove specific partition mapper entries
+    # 7. Force remove specific partition mapper entries
     for i in range(1, 10):
         run(f"dmsetup remove -f {disk_name}p{i} 2>/dev/null || true", check=False)
-        run(f"dmsetup remove -f /dev/mapper/{disk_name}p{i} 2>/dev/null || true", check=False)
 
-    # 5. Kill any processes using the partition
-    run(f"fuser -k {ROOT_PART} 2>/dev/null || true", check=False)
-    run(f"fuser -k /dev/mapper/{disk_name}p3 2>/dev/null || true", check=False)
+    # 8. Kill any processes using the raw partition
+    run(f"fuser -km {ROOT_PART} 2>/dev/null || true", check=False)
 
-    # 6. Unmount if somehow mounted
+    # 9. Unmount the raw partition if somehow mounted
     run(f"umount -l {ROOT_PART} 2>/dev/null || true", check=False)
-    run(f"umount -l /dev/mapper/{disk_name}p3 2>/dev/null || true", check=False)
 
-    # 7. Run kpartx -d again after removing dm entries
+    # 10. Run kpartx -d again
     run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
 
-    # 8. Wipe any existing LUKS header or filesystem signatures
+    # 11. Wipe any existing LUKS header or filesystem signatures
     run(f"wipefs -af {ROOT_PART} 2>/dev/null || true", check=False)
 
-    # 9. Sync and let kernel catch up
+    # 12. Sync and let kernel catch up
     run("sync", check=False)
     time.sleep(2)
 
+    # Verify cryptroot is gone
+    if Path(CRYPT_PATH).exists():
+        print(f"  WARNING: {CRYPT_PATH} still exists, forcing removal...")
+        run(f"dmsetup remove -f {CRYPT_NAME} 2>/dev/null || true", check=False)
+        time.sleep(1)
+
     # Format with LUKS2 (using argon2id for better security)
-    # Note: Using pbkdf2 for GRUB compatibility if needed later
     run(f"echo -n '{luks_password}' | cryptsetup luksFormat --type luks2 "
         f"--cipher aes-xts-plain64 --key-size 512 --hash sha512 "
         f"--pbkdf argon2id {ROOT_PART} -",
