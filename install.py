@@ -997,6 +997,33 @@ def setup_encryption(luks_password: str):
     """Set up LUKS encryption on root partition."""
     print("\n=== Setting Up Encryption ===")
 
+    # Clean up any existing LUKS mappings or stale references to the partition
+    print("Cleaning up any existing encryption mappings...")
+    run(f"cryptsetup close {CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # Close any other LUKS mappings that might be using this partition
+    result = run("dmsetup ls", capture=True, check=False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            dm_name = line.split()[0] if line.split() else ""
+            if dm_name:
+                run(f"cryptsetup close {dm_name} 2>/dev/null || true", check=False)
+
+    # Remove any device-mapper entries for the root partition
+    run(f"dmsetup remove {ROOT_PART} 2>/dev/null || true", check=False)
+
+    # Make sure partition is not in use
+    run(f"fuser -k {ROOT_PART} 2>/dev/null || true", check=False)
+
+    # Remove kpartx mappings that might interfere
+    run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
+
+    # Wipe any existing LUKS header or filesystem signatures
+    run(f"wipefs -af {ROOT_PART}", check=False)
+
+    # Small delay to let kernel release resources
+    time.sleep(1)
+
     # Format with LUKS2 (using argon2id for better security)
     # Note: Using pbkdf2 for GRUB compatibility if needed later
     run(f"echo -n '{luks_password}' | cryptsetup luksFormat --type luks2 "
