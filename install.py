@@ -1570,7 +1570,7 @@ def install_desktop():
         "qt6-wayland",
     ]
 
-    run(f"pacman -S --noconfirm {' '.join(packages)}", chroot=True)
+    run(f"pacman -Sy --noconfirm {' '.join(packages)}", chroot=True)
 
     print("Desktop environment installed.")
 
