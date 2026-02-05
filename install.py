@@ -387,6 +387,13 @@ def setup_arch_tools_on_ubuntu():
     # Need to download Arch bootstrap since pacman is not available
     print("pacman not found - downloading Arch Linux bootstrap...")
     ARCH_BOOTSTRAP_DIR = "/tmp/arch-bootstrap"
+
+    # Check if bootstrap already exists and is set up
+    if Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacman").exists():
+        print("Arch bootstrap already exists, reusing...")
+        setup_bootstrap_mounts(ARCH_BOOTSTRAP_DIR)
+        return
+
     Path(ARCH_BOOTSTRAP_DIR).mkdir(parents=True, exist_ok=True)
 
     # Download the bootstrap tarball
@@ -395,18 +402,48 @@ def setup_arch_tools_on_ubuntu():
 
     bootstrap_tar = f"{ARCH_BOOTSTRAP_DIR}/archlinux-bootstrap.tar.zst"
 
-    print(f"Downloading from {bootstrap_url}...")
-    subprocess.run(f"wget -O {bootstrap_tar} {bootstrap_url}", shell=True, check=True)
+    if not Path(bootstrap_tar).exists():
+        print(f"Downloading from {bootstrap_url}...")
+        subprocess.run(f"wget -O {bootstrap_tar} {bootstrap_url}", shell=True, check=True)
 
     print("Extracting bootstrap...")
     subprocess.run(f"tar -xf {bootstrap_tar} -C {ARCH_BOOTSTRAP_DIR} --strip-components=1", shell=True, check=True)
 
-    # Initialize pacman keyring in bootstrap
-    print("Initializing pacman keyring in bootstrap environment...")
-    subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {ARCH_BOOTSTRAP_DIR} pacman-key --init", shell=True, check=False)
-    subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {ARCH_BOOTSTRAP_DIR} pacman-key --populate archlinux", shell=True, check=False)
+    # Set up mounts for the bootstrap environment
+    setup_bootstrap_mounts(ARCH_BOOTSTRAP_DIR)
+
+    # Enable a mirror in pacman.conf
+    print("Configuring pacman mirrors...")
+    mirrorlist = f"{ARCH_BOOTSTRAP_DIR}/etc/pacman.d/mirrorlist"
+    with open(mirrorlist, "w") as f:
+        f.write("Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n")
+        f.write("Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\n")
+
+    # Initialize pacman keyring inside the bootstrap chroot
+    print("Initializing pacman keyring (this may take a moment)...")
+    subprocess.run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacman-key --init'", shell=True, check=True)
+    subprocess.run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacman-key --populate archlinux'", shell=True, check=True)
 
     print("Arch bootstrap tools ready.")
+
+
+def setup_bootstrap_mounts(bootstrap_dir: str):
+    """Set up necessary mounts for the bootstrap environment."""
+    print("Setting up bootstrap environment mounts...")
+
+    # Unmount first in case of stale mounts
+    for mp in ["dev/pts", "dev", "proc", "sys", "tmp"]:
+        subprocess.run(f"umount {bootstrap_dir}/{mp} 2>/dev/null || true", shell=True, check=False)
+
+    # Mount necessary filesystems
+    subprocess.run(f"mount --bind /dev {bootstrap_dir}/dev", shell=True, check=True)
+    subprocess.run(f"mount --bind /dev/pts {bootstrap_dir}/dev/pts", shell=True, check=True)
+    subprocess.run(f"mount -t proc proc {bootstrap_dir}/proc", shell=True, check=True)
+    subprocess.run(f"mount -t sysfs sys {bootstrap_dir}/sys", shell=True, check=True)
+    subprocess.run(f"mount -t tmpfs tmpfs {bootstrap_dir}/tmp", shell=True, check=True)
+
+    # Copy resolv.conf for DNS resolution
+    subprocess.run(f"cp /etc/resolv.conf {bootstrap_dir}/etc/resolv.conf", shell=True, check=True)
 
 
 def manual_chroot_setup(mount_point: str):
@@ -1196,7 +1233,18 @@ def install_base_system():
 
     # Use pacstrap (prefer bootstrap if available, since Ubuntu's pacstrap lacks pacman)
     if ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap").exists():
-        run(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
+        # When using bootstrap, we need to run pacstrap from INSIDE the bootstrap chroot
+        # First, bind mount /mnt into the bootstrap so pacstrap can access it
+        print("Setting up bootstrap for pacstrap...")
+        run(f"mkdir -p {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
+        run(f"mount --bind {MOUNT_POINT} {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}")
+
+        # Run pacstrap from inside the bootstrap chroot
+        pkg_str = ' '.join(packages)
+        run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacstrap -K {MOUNT_POINT} {pkg_str}'")
+
+        # Unmount /mnt from bootstrap
+        run(f"umount {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
     elif shutil.which("pacstrap") and shutil.which("pacman"):
         # Only use system pacstrap if pacman is also available
         run(f"pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
