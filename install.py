@@ -231,6 +231,32 @@ def prompt_with_default(prompt: str, default: str) -> str:
     return response if response else default
 
 
+def normalize_size(size_str: str) -> str:
+    """Normalize a size string to ensure it has a valid unit suffix for sgdisk.
+
+    Accepts formats like: "32", "32G", "32GB", "32g", "32gb", "512M", etc.
+    Returns normalized format like "32G" or "512M".
+    """
+    size_str = size_str.strip().upper()
+
+    # Remove trailing 'B' if present (e.g., "32GB" -> "32G")
+    if size_str.endswith('B') and len(size_str) > 1:
+        size_str = size_str[:-1]
+
+    # If it's just a number, assume gigabytes
+    if size_str.isdigit():
+        return f"{size_str}G"
+
+    # Validate the format: should be number followed by K, M, G, or T
+    import re
+    match = re.match(r'^(\d+)([KMGT])$', size_str)
+    if match:
+        return size_str
+
+    # If we can't parse it, return as-is and let sgdisk handle the error
+    return size_str
+
+
 def select_from_list(prompt: str, options: list, default: str = None) -> str:
     """Let user select from a numbered list or enter custom value."""
     print(f"\n{prompt}")
@@ -365,12 +391,18 @@ def get_configuration() -> dict:
     print("  - For hibernation support: swap >= RAM")
     print("  - Without hibernation: 4-8GB is usually sufficient")
 
-    config['swap_size'] = prompt_with_default("Swap partition size", recommended_swap)
+    swap_input = prompt_with_default("Swap partition size", recommended_swap)
+    config['swap_size'] = normalize_size(swap_input)
     SWAP_SIZE = config['swap_size']
+    if swap_input != config['swap_size']:
+        print(f"  (normalized to: {config['swap_size']})")
 
     print(f"\nRecommended EFI size: 1G (sufficient for multiple kernels)")
-    config['efi_size'] = prompt_with_default("EFI partition size", "1G")
+    efi_input = prompt_with_default("EFI partition size", "1G")
+    config['efi_size'] = normalize_size(efi_input)
     EFI_SIZE = config['efi_size']
+    if efi_input != config['efi_size']:
+        print(f"  (normalized to: {config['efi_size']})")
 
     # === Summary ===
     print("\n" + "=" * 60)
@@ -462,7 +494,42 @@ def partition_disk():
     run("partprobe")
     run("sleep 2")
 
+    # Verify partitions were created correctly
+    verify_partitions()
+
     print("Partitioning complete.")
+
+
+def verify_partitions():
+    """Verify that partitions were created with reasonable sizes."""
+    print("\n--- Verifying Partitions ---")
+
+    # Use lsblk to get partition sizes in bytes
+    result = run(f"lsblk -b -n -o SIZE {SWAP_PART}", capture=True, check=False)
+    if result.returncode != 0:
+        print(f"Warning: Could not verify partition {SWAP_PART}")
+        return
+
+    try:
+        swap_bytes = int(result.stdout.strip())
+        swap_mb = swap_bytes / (1024 * 1024)
+        swap_gb = swap_bytes / (1024 * 1024 * 1024)
+
+        print(f"  EFI partition:  {EFI_PART}")
+        print(f"  Swap partition: {SWAP_PART} ({swap_gb:.1f} GB)")
+        print(f"  Root partition: {ROOT_PART}")
+
+        # Swap should be at least 1GB for any reasonable use
+        min_swap_mb = 1024  # 1GB minimum
+        if swap_mb < min_swap_mb:
+            print(f"\nERROR: Swap partition is too small ({swap_mb:.1f} MB)!")
+            print(f"Expected at least 1GB. Got {swap_mb:.1f} MB.")
+            print(f"This usually means the size format was incorrect.")
+            print(f"Use format like '32G' for 32 gigabytes, not just '32'.")
+            sys.exit(1)
+
+    except (ValueError, AttributeError) as e:
+        print(f"Warning: Could not parse partition size: {e}")
 
 
 def setup_encryption(luks_password: str):
