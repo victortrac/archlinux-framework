@@ -486,6 +486,7 @@ def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = Fals
         display_cmd: Alternative command string to display (use with sensitive=True)
         interactive_errors: If True and check=True, prompt user on failure with skip/retry/abort options
     """
+    original_cmd = cmd
     if chroot:
         # Prefer arch-chroot if available
         if shutil.which("arch-chroot"):
@@ -533,7 +534,13 @@ def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = Fals
             print(f"Error output: {result.stderr.strip()}")
 
         while True:
-            response = input("[s]kip, [r]etry, [e]dit (open shell), or [a]bort? ").strip().lower()
+            try:
+                response = input("[s]kip, [r]etry, [e]dit (open shell), or [a]bort? ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborting...")
+                raise subprocess.CalledProcessError(result.returncode, cmd,
+                                                    result.stdout if capture else None,
+                                                    result.stderr if capture else None)
             if response in ('s', 'skip'):
                 print("Skipping command...")
                 return result  # Return failed result but don't raise
@@ -543,16 +550,44 @@ def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = Fals
             elif response in ('e', 'edit'):
                 print("Opening shell for manual intervention...")
                 print("Type 'exit' when done to return to the installer.")
+                print("Press Up arrow to access the failed command.")
                 if chroot:
-                    # Open shell in chroot environment
+                    # Write rcfile inside the chroot to pre-load failed command into history
+                    cmd_file_host = f"{MOUNT_POINT}/root/.installer-cmd"
+                    rc_file_host = f"{MOUNT_POINT}/root/.installer-rcfile"
+                    with open(cmd_file_host, 'w') as f:
+                        f.write(original_cmd + '\n')
+                    with open(rc_file_host, 'w') as f:
+                        f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n')
+                        f.write('[ -f ~/.bashrc ] && . ~/.bashrc\n')
+                        f.write('history -r /root/.installer-cmd\n')
                     if shutil.which("arch-chroot"):
-                        subprocess.run(f"arch-chroot {MOUNT_POINT} /bin/bash", shell=True)
+                        subprocess.run(f"arch-chroot {MOUNT_POINT} /bin/bash --rcfile /root/.installer-rcfile", shell=True)
                     elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot").exists():
-                        subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {MOUNT_POINT} /bin/bash", shell=True)
+                        subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {MOUNT_POINT} /bin/bash --rcfile /root/.installer-rcfile", shell=True)
                     else:
-                        subprocess.run(f"chroot {MOUNT_POINT} /bin/bash", shell=True)
+                        subprocess.run(f"chroot {MOUNT_POINT} /bin/bash --rcfile /root/.installer-rcfile", shell=True)
+                    for f_path in [cmd_file_host, rc_file_host]:
+                        try:
+                            os.unlink(f_path)
+                        except OSError:
+                            pass
                 else:
-                    subprocess.run("/bin/bash", shell=True)
+                    # Write rcfile to /tmp to pre-load failed command into history
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='installer-', suffix='.cmd') as f:
+                        f.write(original_cmd + '\n')
+                        cmd_file = f.name
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='installer-', suffix='.bashrc') as f:
+                        f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n')
+                        f.write('[ -f ~/.bashrc ] && . ~/.bashrc\n')
+                        f.write(f'history -r {cmd_file}\n')
+                        rc_file = f.name
+                    subprocess.run(f"/bin/bash --rcfile {rc_file}", shell=True)
+                    for f_path in [cmd_file, rc_file]:
+                        try:
+                            os.unlink(f_path)
+                        except OSError:
+                            pass
                 print("Returned from shell.")
                 # Loop back to ask what to do next
             elif response in ('a', 'abort'):
@@ -1292,17 +1327,21 @@ def install_base_system():
     # Use pacstrap (prefer bootstrap if available, since Ubuntu's pacstrap lacks pacman)
     if ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap").exists():
         # When using bootstrap, we need to run pacstrap from INSIDE the bootstrap chroot
-        # First, bind mount /mnt into the bootstrap so pacstrap can access it
+        # Recursively bind mount /mnt into the bootstrap so pacstrap can access
+        # all subvolume mounts (e.g. @var at /mnt/var). A plain --bind would only
+        # capture the root subvolume, causing pacstrap to write the pacman database
+        # to the wrong subvolume where it gets hidden once @var is mounted on top.
         print("Setting up bootstrap for pacstrap...")
         run(f"mkdir -p {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
-        run(f"mount --bind {MOUNT_POINT} {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}")
+        run(f"mount --rbind {MOUNT_POINT} {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}")
+        run(f"mount --make-rslave {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}")
 
         # Run pacstrap from inside the bootstrap chroot
         pkg_str = ' '.join(packages)
         run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacstrap -K {MOUNT_POINT} {pkg_str}'")
 
-        # Unmount /mnt from bootstrap
-        run(f"umount {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
+        # Recursively unmount /mnt from bootstrap
+        run(f"umount -R {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
     elif shutil.which("pacstrap") and shutil.which("pacman"):
         # Only use system pacstrap if pacman is also available
         run(f"pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
@@ -1585,7 +1624,8 @@ def install_desktop():
         "qt6-wayland",
     ]
 
-    run(f"pacman -Sy --noconfirm {' '.join(packages)}", chroot=True)
+    pkg_str = ' '.join(packages)
+    run(f"pacman -Syu --needed --noconfirm {pkg_str}", chroot=True)
 
     print("Desktop environment installed.")
 
@@ -1836,6 +1876,7 @@ def enable_services():
         "bluetooth",
         "fstrim.timer",
         "power-profiles-daemon",
+        "sddm",
     ]
 
     for service in services:
