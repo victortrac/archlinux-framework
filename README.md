@@ -82,7 +82,7 @@ ping -c 3 1.1.1.1
 cd /media/ubuntu/YOUR_USB_DRIVE  # or wherever you saved it
 
 # Or download it:
-# wget https://raw.githubusercontent.com/yourusername/archlinux-framework/main/install.py
+# wget https://raw.githubusercontent.com/victortrac/archlinux-framework/main/install.py
 
 # Make executable and run as root
 chmod +x install.py
