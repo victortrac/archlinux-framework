@@ -29,13 +29,35 @@ import os
 import getpass
 import shutil
 import tempfile
+import time
 import urllib.request
 import tarfile
+import json
 from pathlib import Path
 
 # Live environment detection
 LIVE_ENV = None  # Will be set to "arch" or "ubuntu"
 ARCH_BOOTSTRAP_DIR = None  # Path to Arch bootstrap if on Ubuntu
+
+# Checkpoint file for resuming failed installations
+CHECKPOINT_FILE = "/tmp/archlinux-installer-checkpoint.json"
+
+# Installation steps in order (used for checkpointing)
+INSTALLATION_STEPS = [
+    "partition_disk",
+    "setup_encryption",
+    "format_filesystems",
+    "create_btrfs_subvolumes",
+    "mount_filesystems",
+    "install_base_system",
+    "generate_fstab",
+    "configure_system",
+    "configure_mkinitcpio",
+    "install_bootloader",
+    "install_desktop",
+    "create_hyprland_config",
+    "enable_services",
+]
 
 # Default Configuration (will be overridden by user input)
 DISK = "/dev/nvme0n1"
@@ -104,6 +126,209 @@ CRYPT_PATH = f"/dev/mapper/{CRYPT_NAME}"
 MOUNT_POINT = "/mnt"
 
 
+# =============================================================================
+# Checkpoint System - Save/Resume Installation Progress
+# =============================================================================
+
+def save_checkpoint(step: str, config: dict, credentials: dict = None):
+    """Save installation progress to checkpoint file.
+
+    Args:
+        step: The step that was just COMPLETED successfully
+        config: Configuration dictionary (disk, hostname, etc.)
+        credentials: Optional dict with username (passwords are not saved for security)
+    """
+    checkpoint = {
+        "completed_step": step,
+        "step_index": INSTALLATION_STEPS.index(step) if step in INSTALLATION_STEPS else -1,
+        "config": {
+            "disk": DISK,
+            "efi_size": EFI_SIZE,
+            "swap_size": SWAP_SIZE,
+            "hostname": HOSTNAME,
+            "timezone": TIMEZONE,
+            "locale": LOCALE,
+            "keymap": KEYMAP,
+        },
+        "username": credentials.get("username") if credentials else None,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(checkpoint, f, indent=2)
+
+    print(f"  [Checkpoint saved: {step}]")
+
+
+def load_checkpoint() -> dict:
+    """Load checkpoint from file if it exists.
+
+    Returns:
+        Checkpoint dictionary or None if no checkpoint exists
+    """
+    if not Path(CHECKPOINT_FILE).exists():
+        return None
+
+    try:
+        with open(CHECKPOINT_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Could not read checkpoint file: {e}")
+        return None
+
+
+def clear_checkpoint():
+    """Remove checkpoint file after successful installation."""
+    if Path(CHECKPOINT_FILE).exists():
+        Path(CHECKPOINT_FILE).unlink()
+        print("Checkpoint cleared.")
+
+
+def get_next_step(checkpoint: dict) -> str:
+    """Get the next step to execute based on checkpoint.
+
+    Args:
+        checkpoint: Loaded checkpoint dictionary
+
+    Returns:
+        Name of the next step to execute, or None if all steps completed
+    """
+    if not checkpoint:
+        return INSTALLATION_STEPS[0]
+
+    completed_index = checkpoint.get("step_index", -1)
+    next_index = completed_index + 1
+
+    if next_index >= len(INSTALLATION_STEPS):
+        return None  # All steps completed
+
+    return INSTALLATION_STEPS[next_index]
+
+
+def detect_installation_state() -> dict:
+    """Detect the current state of the installation by checking what exists.
+
+    This validates the checkpoint against actual system state.
+
+    Returns:
+        Dictionary with detected state information
+    """
+    state = {
+        "partitions_exist": all(Path(f"{DISK}p{i}").exists() for i in range(1, 4)),
+        "luks_open": Path(CRYPT_PATH).exists(),
+        "filesystems_mounted": Path(f"{MOUNT_POINT}/etc").exists(),
+        "base_installed": Path(f"{MOUNT_POINT}/usr/bin/pacman").exists(),
+        "fstab_exists": Path(f"{MOUNT_POINT}/etc/fstab").exists(),
+        "bootloader_installed": Path(f"{MOUNT_POINT}/boot/efi/loader/loader.conf").exists(),
+        "desktop_installed": Path(f"{MOUNT_POINT}/usr/bin/hyprland").exists() or
+                            Path(f"{MOUNT_POINT}/usr/bin/Hyprland").exists(),
+    }
+    return state
+
+
+def validate_checkpoint(checkpoint: dict) -> tuple:
+    """Validate checkpoint against actual system state.
+
+    Returns:
+        Tuple of (is_valid, recommended_step, message)
+    """
+    if not checkpoint:
+        return (True, INSTALLATION_STEPS[0], "No checkpoint found, starting fresh")
+
+    state = detect_installation_state()
+    completed_step = checkpoint.get("completed_step", "")
+    step_index = checkpoint.get("step_index", -1)
+
+    # Check if system state matches checkpoint
+    # This prevents resuming from wrong state if user manually changed things
+
+    if step_index >= INSTALLATION_STEPS.index("install_base_system"):
+        # If we're past base install, verify it's actually installed
+        if not state["base_installed"]:
+            # Base system not found - need to remount or start over
+            if state["luks_open"] and state["partitions_exist"]:
+                return (True, "mount_filesystems",
+                        "Base system not found but LUKS is open. Will remount and continue.")
+            elif state["partitions_exist"]:
+                return (True, "setup_encryption",
+                        "Partitions exist but LUKS not open. Will resume from encryption.")
+            else:
+                return (False, INSTALLATION_STEPS[0],
+                        "Checkpoint invalid: partitions don't exist. Starting fresh.")
+
+    if step_index >= INSTALLATION_STEPS.index("mount_filesystems"):
+        if not state["filesystems_mounted"] and state["luks_open"]:
+            return (True, "mount_filesystems",
+                    "Filesystems not mounted. Will remount and continue.")
+
+    if step_index >= INSTALLATION_STEPS.index("setup_encryption"):
+        if not state["luks_open"] and state["partitions_exist"]:
+            return (True, "setup_encryption",
+                    "LUKS not open. Will need encryption password to continue.")
+
+    # Checkpoint seems valid
+    next_step = get_next_step(checkpoint)
+    if next_step:
+        return (True, next_step, f"Resuming from step: {next_step}")
+    else:
+        return (True, None, "All steps already completed!")
+
+
+def restore_config_from_checkpoint(checkpoint: dict):
+    """Restore global configuration from checkpoint."""
+    global DISK, EFI_SIZE, SWAP_SIZE, HOSTNAME, TIMEZONE, LOCALE, KEYMAP
+    global EFI_PART, SWAP_PART, ROOT_PART
+
+    config = checkpoint.get("config", {})
+
+    if config.get("disk"):
+        DISK = config["disk"]
+        EFI_PART = f"{DISK}p1"
+        SWAP_PART = f"{DISK}p2"
+        ROOT_PART = f"{DISK}p3"
+
+    if config.get("efi_size"):
+        EFI_SIZE = config["efi_size"]
+    if config.get("swap_size"):
+        SWAP_SIZE = config["swap_size"]
+    if config.get("hostname"):
+        HOSTNAME = config["hostname"]
+    if config.get("timezone"):
+        TIMEZONE = config["timezone"]
+    if config.get("locale"):
+        LOCALE = config["locale"]
+    if config.get("keymap"):
+        KEYMAP = config["keymap"]
+
+
+def print_checkpoint_status(checkpoint: dict):
+    """Print information about the checkpoint."""
+    print("\n" + "=" * 60)
+    print("            PREVIOUS INSTALLATION FOUND")
+    print("=" * 60)
+
+    print(f"\n  Checkpoint file: {CHECKPOINT_FILE}")
+    print(f"  Last completed step: {checkpoint.get('completed_step', 'unknown')}")
+    print(f"  Timestamp: {checkpoint.get('timestamp', 'unknown')}")
+
+    config = checkpoint.get("config", {})
+    print(f"\n  Saved configuration:")
+    print(f"    Disk: {config.get('disk', 'unknown')}")
+    print(f"    Hostname: {config.get('hostname', 'unknown')}")
+    print(f"    Username: {checkpoint.get('username', 'unknown')}")
+
+    is_valid, next_step, message = validate_checkpoint(checkpoint)
+    print(f"\n  Status: {message}")
+
+    if next_step:
+        step_num = INSTALLATION_STEPS.index(next_step) + 1
+        print(f"  Will resume at step {step_num}/{len(INSTALLATION_STEPS)}: {next_step}")
+
+
+# =============================================================================
+# Environment Detection
+# =============================================================================
+
 def detect_live_environment() -> str:
     """Detect if running from Arch or Ubuntu live environment."""
     global LIVE_ENV
@@ -148,20 +373,28 @@ def setup_arch_tools_on_ubuntu():
     print("Installing required packages on Ubuntu...")
     subprocess.run("apt-get update", shell=True, check=True)
     subprocess.run(
-        "apt-get install -y wget tar zstd arch-install-scripts 2>/dev/null || "
-        "apt-get install -y wget tar zstd",
+        "apt-get install -y wget tar zstd parted kpartx arch-install-scripts 2>/dev/null || "
+        "apt-get install -y wget tar zstd parted kpartx",
         shell=True,
         check=True
     )
 
-    # Check if arch-install-scripts is available (provides pacstrap, genfstab, arch-chroot)
-    if shutil.which("pacstrap"):
-        print("arch-install-scripts is available from Ubuntu repos")
+    # Check if pacman is available (not just pacstrap - Ubuntu provides pacstrap without pacman)
+    if shutil.which("pacman"):
+        print("pacman is available - can use native arch-install-scripts")
         return
 
-    # If arch-install-scripts not available, download Arch bootstrap
-    print("Downloading Arch Linux bootstrap...")
+    # Need to download Arch bootstrap since pacman is not available
+    print("pacman not found - downloading Arch Linux bootstrap...")
     ARCH_BOOTSTRAP_DIR = "/tmp/arch-bootstrap"
+
+    # Check if bootstrap already exists and is set up
+    if Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacman").exists():
+        print("Arch bootstrap already exists, reusing...")
+        setup_bootstrap_mounts(ARCH_BOOTSTRAP_DIR)
+        configure_bootstrap_mirrors(ARCH_BOOTSTRAP_DIR)
+        return
+
     Path(ARCH_BOOTSTRAP_DIR).mkdir(parents=True, exist_ok=True)
 
     # Download the bootstrap tarball
@@ -170,18 +403,53 @@ def setup_arch_tools_on_ubuntu():
 
     bootstrap_tar = f"{ARCH_BOOTSTRAP_DIR}/archlinux-bootstrap.tar.zst"
 
-    print(f"Downloading from {bootstrap_url}...")
-    subprocess.run(f"wget -O {bootstrap_tar} {bootstrap_url}", shell=True, check=True)
+    if not Path(bootstrap_tar).exists():
+        print(f"Downloading from {bootstrap_url}...")
+        subprocess.run(f"wget -O {bootstrap_tar} {bootstrap_url}", shell=True, check=True)
 
     print("Extracting bootstrap...")
     subprocess.run(f"tar -xf {bootstrap_tar} -C {ARCH_BOOTSTRAP_DIR} --strip-components=1", shell=True, check=True)
 
-    # Initialize pacman keyring in bootstrap
-    print("Initializing pacman keyring in bootstrap environment...")
-    subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {ARCH_BOOTSTRAP_DIR} pacman-key --init", shell=True, check=False)
-    subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {ARCH_BOOTSTRAP_DIR} pacman-key --populate archlinux", shell=True, check=False)
+    # Set up mounts for the bootstrap environment
+    setup_bootstrap_mounts(ARCH_BOOTSTRAP_DIR)
+
+    # Configure mirrors
+    configure_bootstrap_mirrors(ARCH_BOOTSTRAP_DIR)
+
+    # Initialize pacman keyring inside the bootstrap chroot
+    print("Initializing pacman keyring (this may take a moment)...")
+    subprocess.run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacman-key --init'", shell=True, check=True)
+    subprocess.run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacman-key --populate archlinux'", shell=True, check=True)
 
     print("Arch bootstrap tools ready.")
+
+
+def configure_bootstrap_mirrors(bootstrap_dir: str):
+    """Configure pacman mirrors in the bootstrap environment."""
+    print("Configuring pacman mirrors...")
+    mirrorlist = f"{bootstrap_dir}/etc/pacman.d/mirrorlist"
+    with open(mirrorlist, "w") as f:
+        f.write("Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n")
+        f.write("Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\n")
+
+
+def setup_bootstrap_mounts(bootstrap_dir: str):
+    """Set up necessary mounts for the bootstrap environment."""
+    print("Setting up bootstrap environment mounts...")
+
+    # Unmount first in case of stale mounts
+    for mp in ["dev/pts", "dev", "proc", "sys", "tmp"]:
+        subprocess.run(f"umount {bootstrap_dir}/{mp} 2>/dev/null || true", shell=True, check=False)
+
+    # Mount necessary filesystems
+    subprocess.run(f"mount --bind /dev {bootstrap_dir}/dev", shell=True, check=True)
+    subprocess.run(f"mount --bind /dev/pts {bootstrap_dir}/dev/pts", shell=True, check=True)
+    subprocess.run(f"mount -t proc proc {bootstrap_dir}/proc", shell=True, check=True)
+    subprocess.run(f"mount -t sysfs sys {bootstrap_dir}/sys", shell=True, check=True)
+    subprocess.run(f"mount -t tmpfs tmpfs {bootstrap_dir}/tmp", shell=True, check=True)
+
+    # Copy resolv.conf for DNS resolution
+    subprocess.run(f"cp /etc/resolv.conf {bootstrap_dir}/etc/resolv.conf", shell=True, check=True)
 
 
 def manual_chroot_setup(mount_point: str):
@@ -204,19 +472,130 @@ def manual_chroot_cleanup(mount_point: str):
         subprocess.run(f"umount {mount_point}/{mp} 2>/dev/null || true", shell=True, check=False)
 
 
-def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = False) -> subprocess.CompletedProcess:
-    """Execute a shell command."""
+def run(cmd: str, check: bool = True, capture: bool = False, chroot: bool = False,
+        sensitive: bool = False, display_cmd: str = None,
+        interactive_errors: bool = True) -> subprocess.CompletedProcess:
+    """Execute a shell command.
+
+    Args:
+        cmd: The command to execute
+        check: Raise exception on non-zero exit
+        capture: Capture stdout/stderr
+        chroot: Run command in chroot environment
+        sensitive: If True, don't print the actual command (contains secrets)
+        display_cmd: Alternative command string to display (use with sensitive=True)
+        interactive_errors: If True and check=True, prompt user on failure with skip/retry/abort options
+    """
+    original_cmd = cmd
     if chroot:
         # Prefer arch-chroot if available
         if shutil.which("arch-chroot"):
             cmd = f"arch-chroot {MOUNT_POINT} {cmd}"
+            if display_cmd:
+                display_cmd = f"arch-chroot {MOUNT_POINT} {display_cmd}"
         elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot").exists():
             cmd = f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {MOUNT_POINT} {cmd}"
+            if display_cmd:
+                display_cmd = f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {MOUNT_POINT} {display_cmd}"
         else:
             # Fallback to manual chroot
             cmd = f"chroot {MOUNT_POINT} /bin/bash -c '{cmd}'"
-    print(f">>> {cmd}")
-    return subprocess.run(cmd, shell=True, check=check, capture_output=capture, text=True)
+            if display_cmd:
+                display_cmd = f"chroot {MOUNT_POINT} /bin/bash -c '{display_cmd}'"
+
+    if sensitive:
+        if display_cmd:
+            print(f">>> {display_cmd}")
+        else:
+            print(">>> [command hidden - contains sensitive data]")
+    else:
+        print(f">>> {cmd}")
+
+    while True:
+        result = subprocess.run(cmd, shell=True, check=False, capture_output=capture, text=True)
+
+        if result.returncode == 0:
+            return result
+
+        # Command failed
+        if not check:
+            return result
+
+        # check=True and command failed
+        if not interactive_errors:
+            # Raise exception as before
+            raise subprocess.CalledProcessError(result.returncode, cmd,
+                                                result.stdout if capture else None,
+                                                result.stderr if capture else None)
+
+        # Interactive error handling
+        print(f"\nCommand failed with exit code {result.returncode}")
+        if capture and result.stderr:
+            print(f"Error output: {result.stderr.strip()}")
+
+        while True:
+            try:
+                response = input("[s]kip, [r]etry, [e]dit (open shell), or [a]bort? ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborting...")
+                raise subprocess.CalledProcessError(result.returncode, cmd,
+                                                    result.stdout if capture else None,
+                                                    result.stderr if capture else None)
+            if response in ('s', 'skip'):
+                print("Skipping command...")
+                return result  # Return failed result but don't raise
+            elif response in ('r', 'retry'):
+                print("Retrying...")
+                break  # Break inner loop to retry command
+            elif response in ('e', 'edit'):
+                print("Opening shell for manual intervention...")
+                print("Type 'exit' when done to return to the installer.")
+                print("Press Up arrow to access the failed command.")
+                if chroot:
+                    # Write rcfile inside the chroot to pre-load failed command into history
+                    cmd_file_host = f"{MOUNT_POINT}/root/.installer-cmd"
+                    rc_file_host = f"{MOUNT_POINT}/root/.installer-rcfile"
+                    with open(cmd_file_host, 'w') as f:
+                        f.write(original_cmd + '\n')
+                    with open(rc_file_host, 'w') as f:
+                        f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n')
+                        f.write('[ -f ~/.bashrc ] && . ~/.bashrc\n')
+                        f.write('history -r /root/.installer-cmd\n')
+                    if shutil.which("arch-chroot"):
+                        subprocess.run(f"arch-chroot {MOUNT_POINT} /bin/bash --rcfile /root/.installer-rcfile", shell=True)
+                    elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot").exists():
+                        subprocess.run(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot {MOUNT_POINT} /bin/bash --rcfile /root/.installer-rcfile", shell=True)
+                    else:
+                        subprocess.run(f"chroot {MOUNT_POINT} /bin/bash --rcfile /root/.installer-rcfile", shell=True)
+                    for f_path in [cmd_file_host, rc_file_host]:
+                        try:
+                            os.unlink(f_path)
+                        except OSError:
+                            pass
+                else:
+                    # Write rcfile to /tmp to pre-load failed command into history
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='installer-', suffix='.cmd') as f:
+                        f.write(original_cmd + '\n')
+                        cmd_file = f.name
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, prefix='installer-', suffix='.bashrc') as f:
+                        f.write('[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc\n')
+                        f.write('[ -f ~/.bashrc ] && . ~/.bashrc\n')
+                        f.write(f'history -r {cmd_file}\n')
+                        rc_file = f.name
+                    subprocess.run(f"/bin/bash --rcfile {rc_file}", shell=True)
+                    for f_path in [cmd_file, rc_file]:
+                        try:
+                            os.unlink(f_path)
+                        except OSError:
+                            pass
+                print("Returned from shell.")
+                # Loop back to ask what to do next
+            elif response in ('a', 'abort'):
+                raise subprocess.CalledProcessError(result.returncode, cmd,
+                                                    result.stdout if capture else None,
+                                                    result.stderr if capture else None)
+            else:
+                print("Please enter 's' to skip, 'r' to retry, 'e' to edit, or 'a' to abort.")
 
 
 def confirm(prompt: str) -> bool:
@@ -430,11 +809,53 @@ def get_configuration() -> dict:
     return config
 
 
+def get_password_masked(prompt: str) -> str:
+    """Read password from terminal, displaying * for each character.
+
+    This provides visual feedback that keys are being pressed while
+    keeping the actual password hidden.
+    """
+    import termios
+    import tty
+
+    print(f"{prompt}: ", end="", flush=True)
+    password = []
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    try:
+        tty.setraw(fd)
+        while True:
+            char = sys.stdin.read(1)
+            if char in ('\r', '\n'):  # Enter pressed
+                print()  # New line
+                break
+            elif char == '\x7f' or char == '\x08':  # Backspace
+                if password:
+                    password.pop()
+                    # Move cursor back, overwrite with space, move back again
+                    print('\b \b', end="", flush=True)
+            elif char == '\x03':  # Ctrl+C
+                print()
+                raise KeyboardInterrupt
+            elif char >= ' ':  # Printable character
+                password.append(char)
+                print('*', end="", flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    return ''.join(password)
+
+
 def get_password(prompt: str) -> str:
-    """Get password with confirmation."""
+    """Get password with confirmation, showing * for each character typed."""
     while True:
-        password = getpass.getpass(f"{prompt}: ")
-        confirm_pass = getpass.getpass("Confirm password: ")
+        password = get_password_masked(prompt)
+        if not password:
+            print("Password cannot be empty. Try again.")
+            continue
+        confirm_pass = get_password_masked("Confirm password")
         if password == confirm_pass:
             return password
         print("Passwords do not match. Try again.")
@@ -471,9 +892,179 @@ def check_requirements():
     print("All requirements met.")
 
 
+def reload_partition_table(disk: str):
+    """Reload the partition table using multiple methods with fallbacks.
+
+    partprobe can fail with 'Device or resource busy' if the kernel still
+    has references to old partitions. This is common when running from a
+    live environment. We try multiple methods and ultimately verify that
+    the partition devices actually exist.
+    """
+    print("\n--- Reloading Partition Table ---")
+
+    def partitions_exist():
+        """Check if all partition devices exist."""
+        for part in [f"{disk}p1", f"{disk}p2", f"{disk}p3"]:
+            if not Path(part).exists():
+                return False
+        return True
+
+    # Method 1: partprobe on specific disk
+    result = run(f"partprobe {disk}", check=False)
+    if result.returncode == 0:
+        print("partprobe succeeded")
+        time.sleep(2)
+        if partitions_exist():
+            return
+
+    print("partprobe returned non-zero or partitions not visible, trying alternatives...")
+
+    # Method 2: blockdev --rereadpt
+    result = run(f"blockdev --rereadpt {disk}", check=False)
+    if result.returncode == 0:
+        print("blockdev --rereadpt succeeded")
+        time.sleep(2)
+        if partitions_exist():
+            print("All partition devices exist - continuing installation")
+            return
+
+    # Method 3: partx -a (add all partitions)
+    print("Trying partx to add partitions...")
+    run(f"partx -d {disk} 2>/dev/null || true", check=False)  # Remove first
+    result = run(f"partx -a {disk}", check=False)
+    if result.returncode == 0:
+        print("partx -a succeeded")
+        time.sleep(2)
+        if partitions_exist():
+            print("All partition devices exist - continuing installation")
+            return
+
+    # Method 4: kpartx - forcefully create device mappings
+    print("Trying kpartx to create partition mappings...")
+    run(f"kpartx -d {disk} 2>/dev/null || true", check=False)  # Remove old mappings
+    result = run(f"kpartx -av {disk}", check=False)
+    if result.returncode == 0:
+        print("kpartx succeeded")
+        time.sleep(2)
+        # kpartx creates /dev/mapper/diskpN devices, check for those too
+        disk_name = Path(disk).name
+        kpartx_devs_exist = all(
+            Path(f"/dev/mapper/{disk_name}p{i}").exists() for i in range(1, 4)
+        )
+        if partitions_exist() or kpartx_devs_exist:
+            # If kpartx created mapper devices, create symlinks to expected paths
+            if kpartx_devs_exist and not partitions_exist():
+                print("Creating symlinks from kpartx devices...")
+                for i in range(1, 4):
+                    src = f"/dev/mapper/{disk_name}p{i}"
+                    dst = f"{disk}p{i}"
+                    if Path(src).exists() and not Path(dst).exists():
+                        run(f"ln -sf {src} {dst}", check=False)
+            print("Partition devices available - continuing installation")
+            return
+
+    # Give the kernel time to process
+    time.sleep(2)
+
+    # Trigger udev and wait
+    print("Triggering udev...")
+    run("udevadm trigger", check=False)
+    run("udevadm settle --timeout=10", check=False)
+    time.sleep(2)
+
+    # Final verification
+    if partitions_exist():
+        print("All partition devices exist - continuing installation")
+        return
+
+    # Check for kpartx devices one more time
+    disk_name = Path(disk).name
+    kpartx_devs = [f"/dev/mapper/{disk_name}p{i}" for i in range(1, 4)]
+    if all(Path(dev).exists() for dev in kpartx_devs):
+        print("Using kpartx device mappings...")
+        for i in range(1, 4):
+            src = f"/dev/mapper/{disk_name}p{i}"
+            dst = f"{disk}p{i}"
+            if not Path(dst).exists():
+                run(f"ln -sf {src} {dst}", check=False)
+        if partitions_exist():
+            print("Partition devices available via symlinks - continuing installation")
+            return
+
+    # Give up with helpful error
+    missing = [f"{disk}p{i}" for i in range(1, 4) if not Path(f"{disk}p{i}").exists()]
+    print(f"\nERROR: Partition devices not found: {', '.join(missing)}")
+    print("\nThe kernel is unable to recognize the new partition table.")
+    print("This is a known issue when running from a live environment")
+    print("that has previously accessed the target disk.")
+    print("\nRECOMMENDED: Reboot the live environment and run the installer again.")
+    print("\nAlternative solutions:")
+    print("  1. Run: kpartx -av " + disk)
+    print("  2. Check 'lsblk' and 'dmsetup ls' for conflicting mappings")
+    print("  3. Ensure no processes are using the disk (lsof " + disk + ")")
+    sys.exit(1)
+
+
+def cleanup_disk_references(disk: str):
+    """Aggressively clean up any kernel references to the disk before partitioning.
+
+    This is necessary when running from a live environment that may have
+    previously accessed the disk, leaving stale partition mappings.
+    """
+    print("\n--- Cleaning Up Disk References ---")
+
+    # Get the disk basename (e.g., "nvme0n1" from "/dev/nvme0n1")
+    disk_name = Path(disk).name
+
+    # 1. Unmount any mounted partitions from this disk
+    print("Unmounting any mounted partitions...")
+    result = run("mount", capture=True, check=False)
+    for line in result.stdout.splitlines():
+        if disk in line:
+            mount_point = line.split()[2] if len(line.split()) > 2 else None
+            if mount_point:
+                run(f"umount -l {mount_point}", check=False)
+
+    # 2. Deactivate any swap on this disk
+    print("Deactivating swap...")
+    run(f"swapoff {disk}p2 2>/dev/null || true", check=False)
+    run(f"swapoff {disk}* 2>/dev/null || true", check=False)
+
+    # 3. Close any LUKS mappings that might use this disk
+    print("Closing any LUKS mappings...")
+    result = run("dmsetup ls", capture=True, check=False)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if "crypt" in line.lower() or "luks" in line.lower():
+                dm_name = line.split()[0]
+                run(f"cryptsetup close {dm_name}", check=False)
+
+    # 4. Remove device-mapper entries for this disk
+    print("Removing device-mapper entries...")
+    for i in range(1, 10):
+        run(f"dmsetup remove {disk_name}p{i} 2>/dev/null || true", check=False)
+        run(f"dmsetup remove {disk}p{i} 2>/dev/null || true", check=False)
+
+    # 5. Remove partition mappings with kpartx
+    print("Removing partition mappings...")
+    run(f"kpartx -d {disk} 2>/dev/null || true", check=False)
+
+    # 6. Force kernel to drop caches related to the disk
+    run("sync", check=False)
+    run("echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true", check=False)
+
+    # 7. Wait a moment for everything to settle
+    time.sleep(1)
+
+    print("Disk cleanup complete.")
+
+
 def partition_disk():
     """Create GPT partitions on the disk."""
     print("\n=== Partitioning Disk ===")
+
+    # Aggressively clean up any existing references to the disk
+    cleanup_disk_references(DISK)
 
     # Wipe existing partitions
     run(f"wipefs -af {DISK}")
@@ -490,9 +1081,9 @@ def partition_disk():
     # Root partition (remaining space)
     run(f"sgdisk -n 3:0:0 -t 3:8309 -c 3:'Linux LUKS' {DISK}")
 
-    # Reload partition table
-    run("partprobe")
-    run("sleep 2")
+    # Reload partition table - try multiple methods as partprobe can fail
+    # when the kernel has stale references to old partitions
+    reload_partition_table(DISK)
 
     # Verify partitions were created correctly
     verify_partitions()
@@ -536,14 +1127,86 @@ def setup_encryption(luks_password: str):
     """Set up LUKS encryption on root partition."""
     print("\n=== Setting Up Encryption ===")
 
+    # Get disk basename for device-mapper cleanup
+    disk_name = Path(DISK).name  # e.g., "nvme0n1"
+
+    # Aggressive cleanup of any existing mappings
+    print("Cleaning up any existing mappings...")
+
+    # 1. FIRST: Unmount everything from /mnt (cryptroot might be mounted there)
+    print("  Unmounting /mnt...")
+    run("swapoff -a 2>/dev/null || true", check=False)
+    run(f"umount -R {MOUNT_POINT} 2>/dev/null || true", check=False)
+    run(f"umount -l {MOUNT_POINT} 2>/dev/null || true", check=False)
+
+    # 2. Unmount cryptroot device if mounted anywhere
+    print("  Unmounting cryptroot device...")
+    run(f"umount -l {CRYPT_PATH} 2>/dev/null || true", check=False)
+    run(f"umount -l /dev/mapper/{CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # 3. Kill any processes using cryptroot
+    print("  Killing processes using cryptroot...")
+    run(f"fuser -km {CRYPT_PATH} 2>/dev/null || true", check=False)
+    run(f"fuser -km /dev/mapper/{CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # 4. NOW close the cryptroot LUKS mapping
+    print("  Closing LUKS device...")
+    run(f"cryptsetup close {CRYPT_NAME} 2>/dev/null || true", check=False)
+    # Try with dmsetup as fallback
+    run(f"dmsetup remove -f {CRYPT_NAME} 2>/dev/null || true", check=False)
+
+    # 5. Remove kpartx mappings
+    print("  Removing kpartx mappings...")
+    run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
+
+    # 6. Remove ALL device-mapper entries related to this disk
+    result = run("dmsetup ls", capture=True, check=False)
+    if result.returncode == 0 and result.stdout.strip():
+        for line in result.stdout.splitlines():
+            if not line.strip() or "No devices found" in line:
+                continue
+            dm_name = line.split()[0] if line.split() else ""
+            if dm_name and (disk_name in dm_name or "crypt" in dm_name.lower()):
+                print(f"  Removing device-mapper entry: {dm_name}")
+                run(f"dmsetup remove -f {dm_name} 2>/dev/null || true", check=False)
+
+    # 7. Force remove specific partition mapper entries
+    for i in range(1, 10):
+        run(f"dmsetup remove -f {disk_name}p{i} 2>/dev/null || true", check=False)
+
+    # 8. Kill any processes using the raw partition
+    run(f"fuser -km {ROOT_PART} 2>/dev/null || true", check=False)
+
+    # 9. Unmount the raw partition if somehow mounted
+    run(f"umount -l {ROOT_PART} 2>/dev/null || true", check=False)
+
+    # 10. Run kpartx -d again
+    run(f"kpartx -d {DISK} 2>/dev/null || true", check=False)
+
+    # 11. Wipe any existing LUKS header or filesystem signatures
+    run(f"wipefs -af {ROOT_PART} 2>/dev/null || true", check=False)
+
+    # 12. Sync and let kernel catch up
+    run("sync", check=False)
+    time.sleep(2)
+
+    # Verify cryptroot is gone
+    if Path(CRYPT_PATH).exists():
+        print(f"  WARNING: {CRYPT_PATH} still exists, forcing removal...")
+        run(f"dmsetup remove -f {CRYPT_NAME} 2>/dev/null || true", check=False)
+        time.sleep(1)
+
     # Format with LUKS2 (using argon2id for better security)
-    # Note: Using pbkdf2 for GRUB compatibility if needed later
     run(f"echo -n '{luks_password}' | cryptsetup luksFormat --type luks2 "
         f"--cipher aes-xts-plain64 --key-size 512 --hash sha512 "
-        f"--pbkdf argon2id {ROOT_PART} -")
+        f"--pbkdf argon2id {ROOT_PART} -",
+        sensitive=True,
+        display_cmd=f"cryptsetup luksFormat --type luks2 --cipher aes-xts-plain64 --key-size 512 --hash sha512 --pbkdf argon2id {ROOT_PART}")
 
     # Open the encrypted volume
-    run(f"echo -n '{luks_password}' | cryptsetup open {ROOT_PART} {CRYPT_NAME} -")
+    run(f"echo -n '{luks_password}' | cryptsetup open {ROOT_PART} {CRYPT_NAME} -",
+        sensitive=True,
+        display_cmd=f"cryptsetup open {ROOT_PART} {CRYPT_NAME}")
 
     print("Encryption setup complete.")
 
@@ -661,13 +1324,30 @@ def install_base_system():
         "fprintd",  # Fingerprint reader
     ]
 
-    # Use pacstrap (either native or from bootstrap)
-    if shutil.which("pacstrap"):
+    # Use pacstrap (prefer bootstrap if available, since Ubuntu's pacstrap lacks pacman)
+    if ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap").exists():
+        # When using bootstrap, we need to run pacstrap from INSIDE the bootstrap chroot
+        # Recursively bind mount /mnt into the bootstrap so pacstrap can access
+        # all subvolume mounts (e.g. @var at /mnt/var). A plain --bind would only
+        # capture the root subvolume, causing pacstrap to write the pacman database
+        # to the wrong subvolume where it gets hidden once @var is mounted on top.
+        print("Setting up bootstrap for pacstrap...")
+        run(f"mkdir -p {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
+        run(f"mount --rbind {MOUNT_POINT} {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}")
+        run(f"mount --make-rslave {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}")
+
+        # Run pacstrap from inside the bootstrap chroot
+        pkg_str = ' '.join(packages)
+        run(f"chroot {ARCH_BOOTSTRAP_DIR} /bin/bash -c 'pacstrap -K {MOUNT_POINT} {pkg_str}'")
+
+        # Recursively unmount /mnt from bootstrap
+        run(f"umount -R {ARCH_BOOTSTRAP_DIR}{MOUNT_POINT}", check=False)
+    elif shutil.which("pacstrap") and shutil.which("pacman"):
+        # Only use system pacstrap if pacman is also available
         run(f"pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
-    elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap").exists():
-        run(f"{ARCH_BOOTSTRAP_DIR}/bin/pacstrap -K {MOUNT_POINT} {' '.join(packages)}")
     else:
-        print("Error: pacstrap not found. Cannot install base system.")
+        print("Error: pacstrap/pacman not found. Cannot install base system.")
+        print("On Ubuntu, the Arch bootstrap should have been downloaded.")
         sys.exit(1)
 
     print("Base system installed.")
@@ -677,11 +1357,11 @@ def generate_fstab():
     """Generate fstab file."""
     print("\n=== Generating fstab ===")
 
-    # Use genfstab (either native or from bootstrap)
-    if shutil.which("genfstab"):
-        run(f"genfstab -U {MOUNT_POINT} >> {MOUNT_POINT}/etc/fstab")
-    elif ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/genfstab").exists():
+    # Use genfstab (prefer bootstrap if available)
+    if ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/genfstab").exists():
         run(f"{ARCH_BOOTSTRAP_DIR}/bin/genfstab -U {MOUNT_POINT} >> {MOUNT_POINT}/etc/fstab")
+    elif shutil.which("genfstab"):
+        run(f"genfstab -U {MOUNT_POINT} >> {MOUNT_POINT}/etc/fstab")
     else:
         # Manual fstab generation as fallback
         print("genfstab not found, generating fstab manually...")
@@ -762,12 +1442,16 @@ def configure_system(root_password: str, username: str, user_password: str):
 127.0.1.1   {HOSTNAME}.localdomain {HOSTNAME}
 """)
 
-    # Set root password
-    run(f"echo 'root:{root_password}' | chpasswd", chroot=True)
+    # Set root password using chpasswd -R to avoid PAM issues in chroot
+    # Using -R applies changes directly to the target root without needing chroot
+    run(f"echo 'root:{root_password}' | chpasswd -R {MOUNT_POINT}", chroot=False,
+        sensitive=True, display_cmd=f"chpasswd -R {MOUNT_POINT} (setting root password)")
 
     # Create user
     run(f"useradd -m -G wheel,video,audio,input -s /bin/bash {username}", chroot=True)
-    run(f"echo '{username}:{user_password}' | chpasswd", chroot=True)
+    # Set user password using chpasswd -R to avoid PAM issues in chroot
+    run(f"echo '{username}:{user_password}' | chpasswd -R {MOUNT_POINT}", chroot=False,
+        sensitive=True, display_cmd=f"chpasswd -R {MOUNT_POINT} (setting password for {username})")
 
     # Enable sudo for wheel group
     with open(f"{MOUNT_POINT}/etc/sudoers.d/wheel", "w") as f:
@@ -940,7 +1624,8 @@ def install_desktop():
         "qt6-wayland",
     ]
 
-    run(f"pacman -S --noconfirm {' '.join(packages)}", chroot=True)
+    pkg_str = ' '.join(packages)
+    run(f"pacman -Syu --needed --noconfirm {pkg_str}", chroot=True)
 
     print("Desktop environment installed.")
 
@@ -1191,6 +1876,7 @@ def enable_services():
         "bluetooth",
         "fstrim.timer",
         "power-profiles-daemon",
+        "sddm",
     ]
 
     for service in services:
@@ -1217,6 +1903,52 @@ def cleanup():
     print("Cleanup complete.")
 
 
+def run_installation_step(step: str, credentials: dict):
+    """Run a single installation step.
+
+    Args:
+        step: Name of the step to run
+        credentials: Dict with luks_password, root_password, username, user_password
+    """
+    luks_password = credentials.get("luks_password")
+    root_password = credentials.get("root_password")
+    username = credentials.get("username")
+    user_password = credentials.get("user_password")
+
+    if step == "partition_disk":
+        partition_disk()
+    elif step == "setup_encryption":
+        setup_encryption(luks_password)
+    elif step == "format_filesystems":
+        format_filesystems()
+    elif step == "create_btrfs_subvolumes":
+        create_btrfs_subvolumes()
+    elif step == "mount_filesystems":
+        mount_filesystems()
+    elif step == "install_base_system":
+        install_base_system()
+    elif step == "generate_fstab":
+        # Set up chroot environment if arch-chroot is not available
+        if not shutil.which("arch-chroot") and not (ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot").exists()):
+            print("\n=== Setting Up Chroot Environment ===")
+            manual_chroot_setup(MOUNT_POINT)
+        generate_fstab()
+    elif step == "configure_system":
+        configure_system(root_password, username, user_password)
+    elif step == "configure_mkinitcpio":
+        configure_mkinitcpio()
+    elif step == "install_bootloader":
+        install_bootloader()
+    elif step == "install_desktop":
+        install_desktop()
+    elif step == "create_hyprland_config":
+        create_hyprland_config(username)
+    elif step == "enable_services":
+        enable_services()
+    else:
+        raise ValueError(f"Unknown installation step: {step}")
+
+
 def main():
     print("""
 ╔═══════════════════════════════════════════════════════════════╗
@@ -1229,58 +1961,145 @@ def main():
 ║  4. Install Hyprland (Wayland compositor)                     ║
 ║                                                               ║
 ║  Supports: Arch Linux or Ubuntu live environments             ║
+║  Supports: Resume from failed installation (checkpoint)       ║
 ╚═══════════════════════════════════════════════════════════════╝
 """)
 
     # Detect live environment
     detect_live_environment()
 
-    print("\nThis installer will guide you through the configuration process.")
-    print("You'll be asked for timezone, hostname, and other settings.\n")
+    # Check for existing checkpoint
+    checkpoint = load_checkpoint()
+    resuming = False
+    start_step = INSTALLATION_STEPS[0]
+    username = None
 
-    if not confirm("Do you want to continue?"):
-        print("Aborted.")
-        sys.exit(0)
+    if checkpoint:
+        print_checkpoint_status(checkpoint)
 
-    # Set up Arch tools if running from Ubuntu
+        print("\nOptions:")
+        print("  1. Resume from checkpoint")
+        print("  2. Start fresh (delete checkpoint)")
+        print("  3. Cancel")
+
+        while True:
+            choice = input("\nSelect option [1/2/3]: ").strip()
+            if choice == "1":
+                resuming = True
+                is_valid, start_step, message = validate_checkpoint(checkpoint)
+                if not is_valid:
+                    print(f"\nCheckpoint invalid: {message}")
+                    print("Starting fresh installation.")
+                    resuming = False
+                    clear_checkpoint()
+                else:
+                    restore_config_from_checkpoint(checkpoint)
+                    username = checkpoint.get("username")
+                    print(f"\nResuming installation from: {start_step}")
+                break
+            elif choice == "2":
+                clear_checkpoint()
+                print("\nStarting fresh installation.")
+                break
+            elif choice == "3":
+                print("Aborted.")
+                sys.exit(0)
+            else:
+                print("Please enter 1, 2, or 3")
+
+    # Set up Arch tools if running from Ubuntu (needed for both fresh and resume)
     if LIVE_ENV == "ubuntu":
-        print("\nRunning from Ubuntu live environment.")
-        print("Will download and set up Arch Linux bootstrap tools...")
-        if not confirm("Continue with Ubuntu live setup?"):
+        if not shutil.which("pacman"):
+            print("\nRunning from Ubuntu live environment.")
+            if not resuming:
+                print("Will download and set up Arch Linux bootstrap tools...")
+                if not confirm("Continue with Ubuntu live setup?"):
+                    print("Aborted.")
+                    sys.exit(0)
+            else:
+                print("Setting up Arch Linux bootstrap tools for resume...")
+            setup_arch_tools_on_ubuntu()
+
+    if not resuming:
+        print("\nThis installer will guide you through the configuration process.")
+        print("You'll be asked for timezone, hostname, and other settings.\n")
+
+        if not confirm("Do you want to continue?"):
             print("Aborted.")
             sys.exit(0)
-        setup_arch_tools_on_ubuntu()
 
-    # Interactive configuration
-    config = get_configuration()
+        # Interactive configuration
+        config = get_configuration()
 
-    print(f"\nWARNING: ALL DATA ON {DISK} WILL BE DESTROYED!")
+        print(f"\nWARNING: ALL DATA ON {DISK} WILL BE DESTROYED!")
 
-    if not confirm("Is this configuration correct?"):
-        print("Aborted. Please run the installer again.")
-        sys.exit(0)
+        if not confirm("Is this configuration correct?"):
+            print("Aborted. Please run the installer again.")
+            sys.exit(0)
 
-    # Check requirements
-    check_requirements()
+        # Check requirements
+        check_requirements()
+
+    # Determine which credentials we need based on start step
+    start_index = INSTALLATION_STEPS.index(start_step)
+
+    # Always need LUKS password if we're at or before encryption, or if LUKS needs to be reopened
+    need_luks_password = start_index <= INSTALLATION_STEPS.index("setup_encryption")
+    if resuming and not Path(CRYPT_PATH).exists() and start_index > INSTALLATION_STEPS.index("setup_encryption"):
+        # LUKS is closed but we're past encryption step - need to reopen
+        print("\n--- LUKS volume is closed - need password to reopen ---")
+        need_luks_password = True
+
+    # Need user passwords if we're at or before configure_system
+    need_user_passwords = start_index <= INSTALLATION_STEPS.index("configure_system")
 
     # Get passwords
     print("\n" + "=" * 60)
     print("            USER ACCOUNT SETUP")
     print("=" * 60)
 
-    print("\n--- Encryption Password ---")
-    print("This password will be required every time you boot.")
-    luks_password = get_password("Enter LUKS encryption password")
+    if need_luks_password:
+        print("\n--- Encryption Password ---")
+        if resuming and start_index > INSTALLATION_STEPS.index("setup_encryption"):
+            print("(Needed to reopen LUKS volume)")
+        else:
+            print("This password will be required every time you boot.")
+        luks_password = get_password("Enter LUKS encryption password")
+    else:
+        luks_password = None
+        print("\n(Skipping LUKS password - volume already open)")
 
-    print("\n--- Root Account ---")
-    root_password = get_password("Enter root password")
+    if need_user_passwords:
+        print("\n--- Root Account ---")
+        root_password = get_password("Enter root password")
 
-    print("\n--- User Account ---")
-    username = input("Enter username for new user: ").strip()
-    if not username:
-        print("Username cannot be empty.")
-        sys.exit(1)
-    user_password = get_password(f"Enter password for {username}")
+        print("\n--- User Account ---")
+        if username:
+            print(f"(Using username from checkpoint: {username})")
+            if not confirm(f"Keep username '{username}'?"):
+                username = input("Enter new username: ").strip()
+        else:
+            username = input("Enter username for new user: ").strip()
+
+        if not username:
+            print("Username cannot be empty.")
+            sys.exit(1)
+        user_password = get_password(f"Enter password for {username}")
+    else:
+        root_password = None
+        user_password = None
+        print("\n(Skipping user password setup - already configured)")
+        if not username:
+            username = checkpoint.get("username") if checkpoint else None
+        if not username:
+            username = input("Enter username (for Hyprland config): ").strip()
+
+    credentials = {
+        "luks_password": luks_password,
+        "root_password": root_password,
+        "username": username,
+        "user_password": user_password,
+    }
 
     # Final confirmation
     print("\n" + "=" * 60)
@@ -1300,31 +2119,47 @@ def main():
     {ROOT_PART}:  Remaining (encrypted BTRFS)
 """)
 
-    print("WARNING: This will ERASE ALL DATA on the target disk!")
+    if resuming:
+        print(f"  RESUMING FROM: {start_step}")
+        completed = INSTALLATION_STEPS.index(start_step)
+        print(f"  Steps completed: {completed}/{len(INSTALLATION_STEPS)}")
+    else:
+        print("WARNING: This will ERASE ALL DATA on the target disk!")
 
     if not confirm("\nProceed with installation?"):
         print("Aborted.")
         sys.exit(0)
 
-    try:
-        partition_disk()
-        setup_encryption(luks_password)
-        format_filesystems()
-        create_btrfs_subvolumes()
-        mount_filesystems()
-        install_base_system()
+    # If resuming and LUKS is closed, reopen it
+    if resuming and luks_password and not Path(CRYPT_PATH).exists():
+        print("\n=== Reopening LUKS Volume ===")
+        run(f"echo -n '{luks_password}' | cryptsetup open {ROOT_PART} {CRYPT_NAME} -",
+            sensitive=True, display_cmd=f"cryptsetup open {ROOT_PART} {CRYPT_NAME}")
 
-        # Set up chroot environment if arch-chroot is not available
-        if not shutil.which("arch-chroot") and not (ARCH_BOOTSTRAP_DIR and Path(f"{ARCH_BOOTSTRAP_DIR}/bin/arch-chroot").exists()):
-            print("\n=== Setting Up Chroot Environment ===")
-            manual_chroot_setup(MOUNT_POINT)
-        generate_fstab()
-        configure_system(root_password, username, user_password)
-        configure_mkinitcpio()
-        install_bootloader()
-        install_desktop()
-        create_hyprland_config(username)
-        enable_services()
+    # If resuming and filesystems not mounted, remount them
+    if resuming and start_index > INSTALLATION_STEPS.index("mount_filesystems"):
+        if not Path(f"{MOUNT_POINT}/etc").exists():
+            print("\n=== Remounting Filesystems ===")
+            mount_filesystems()
+
+    try:
+        # Run installation steps from start_step onwards
+        for step in INSTALLATION_STEPS:
+            if INSTALLATION_STEPS.index(step) < INSTALLATION_STEPS.index(start_step):
+                print(f"  [Skipping: {step}]")
+                continue
+
+            print(f"\n{'=' * 60}")
+            print(f"  Step {INSTALLATION_STEPS.index(step) + 1}/{len(INSTALLATION_STEPS)}: {step}")
+            print(f"{'=' * 60}")
+
+            run_installation_step(step, credentials)
+
+            # Save checkpoint after successful step
+            save_checkpoint(step, None, {"username": username})
+
+        # Installation complete - clear checkpoint
+        clear_checkpoint()
 
         print("\n" + "=" * 60)
         print("Installation complete!")
@@ -1360,11 +2195,13 @@ Key bindings (in Hyprland):
     except subprocess.CalledProcessError as e:
         print(f"\nError during installation: {e}")
         print("Installation failed. You may need to manually clean up.")
+        print(f"\nCheckpoint saved - you can resume by running the installer again.")
         if confirm("Attempt cleanup?"):
             cleanup()
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nInstallation interrupted.")
+        print(f"Checkpoint saved - you can resume by running the installer again.")
         if confirm("Attempt cleanup?"):
             cleanup()
         sys.exit(1)
